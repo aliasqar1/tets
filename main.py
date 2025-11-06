@@ -5,11 +5,10 @@ import os
 import json
 import random
 import string
-from datetime import datetime, timezone
 from datetime import datetime, timedelta, timezone
 from discord.ext import commands
-from discord import app_commands, Interaction, TextChannel
-from discord.ui import View, Button, Modal, TextInput
+from discord import app_commands, Interaction, TextChannel, Member
+from discord.ui import View, Button, Modal, TextInput, Select
 from dotenv import load_dotenv
 
 # -------------------------
@@ -23,7 +22,15 @@ intents.message_content = True
 intents.members = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+class MyBot(commands.Bot):
+
+    async def setup_hook(self):
+        # اینجا تابع بررسی اشتراک‌ها رو موقع آماده شدن ربات اجرا می‌کنیم
+        self.loop.create_task(check_subscriptions_loop())
+
+
+bot = MyBot(command_prefix="!", intents=intents)
 
 DATA_FILE = "data.json"
 STREAM_FILE = "stream.json"
@@ -31,8 +38,90 @@ file_lock = asyncio.Lock()
 stream_lock = asyncio.Lock()
 
 # -------------------------
+# Data helpers (robust)
+# -------------------------
+DATA_FILE = "data.json"
+file_lock = asyncio.Lock()
+
+
+def ensure_data_file():
+    default = {
+        "wallet": {},
+        "subscription": {},
+        "warns": {},
+        "badges": {},
+        "contests": {},
+        "server_settings": {},
+        "shoprole": {},
+        "orders": []
+    }
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(default, f, ensure_ascii=False, indent=2)
+        return default
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        # اگر فایل خراب بود، با مقدار پیش‌فرض بازنویسی می‌کنیم
+        data = default
+
+    # بررسی کلیدهای ضروری
+    for k, v in default.items():
+        if k not in data:
+            data[k] = v
+
+    return data
+
+
+def load_data():
+    return ensure_data_file()
+
+
+
+
+async def update_data_runtime():
+    # convenience wrapper if you want to save runtime copies
+    d = load_data()
+    await save_data_async(d)
+
+
+# runtime caches (kept minimal)
+data_cache = load_data()
+
+
+# -------------------------
+# Utility
+# -------------------------
+def generate_4digits():
+    return f"{random.randint(0,9999):04d}"
+
+
+def is_admin_member(member: discord.Member) -> bool:
+    if not member:
+        return False
+    for role in member.roles:
+        if role.name in ("ادمین", "Admin", "admin"):
+            return True
+    return False
+
+
+# -------------------------
 # بارگذاری و ذخیره داده‌ها (async-safe)
 # -------------------------
+
+
+def load_data():
+    with open("data.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+async def save_data(data):
+    with open("data.json", "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
@@ -41,7 +130,8 @@ def load_data():
             return json.load(f)
     except Exception:
         return {}
-    
+
+
 def load_json(file_path):
     if not os.path.exists(file_path):
         return {}
@@ -51,29 +141,46 @@ def load_json(file_path):
     except Exception:
         return {}
 
+
 def save_json(file_path, data):
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+
 def generate_invite_code(length=6):
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+    return ''.join(
+        random.choices(string.ascii_uppercase + string.digits, k=length))
+
 
 # داده‌ها
 data = load_json(DATA_FILE)  # موجودی و پول استریمرها
+data_cache = data  # هماهنگ‌سازی اولیه
 stream_data = load_json(STREAM_FILE)  # اطلاعات استریمرها
+
 
 # بررسی استریمر بودن
 def is_streamer(member: discord.Member):
-    return any(role.name in ("استریمر", "استریمر پلاسما") for role in member.roles)
-
-# ذخیره امن داده‌ها
-async def update_data():
+    return any(role.name in ("استریمر", "استریمر پلاسما")
+               for role in member.roles)
+async def save_data_async(data):
+    global data_cache
     async with file_lock:
-        save_json(DATA_FILE, data)
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    # 🧩 پس از ذخیره، حافظه را با فایل هماهنگ کن
+    data_cache = load_data()
+
+
+
+async def update_data():
+    global data_cache
+    await save_data_async(data_cache)
+
 
 async def update_stream():
     async with stream_lock:
         save_json(STREAM_FILE, stream_data)
+
 
 # پاک کردن اطلاعات استریمر هنگام خروج
 @bot.event
@@ -84,6 +191,7 @@ async def on_member_remove(member: discord.Member):
     await update_data()
     await update_stream()
 
+
 # -------------------------
 # نمایش پروفایل استریمر
 # -------------------------
@@ -91,29 +199,37 @@ async def on_member_remove(member: discord.Member):
 async def pstream(interaction: Interaction, member: discord.Member = None):
     user = member or interaction.user
     if not is_streamer(user):
-        await interaction.response.send_message("❌ شما استریمر نیستید.", ephemeral=True)
+        await interaction.response.send_message("❌ شما استریمر نیستید.",
+                                                ephemeral=True)
         return
     uid = str(user.id)
     streamer = stream_data.get(uid)
     if not streamer:
-        await interaction.response.send_message("❌ اطلاعات استریمر یافت نشد.", ephemeral=True)
+        await interaction.response.send_message("❌ اطلاعات استریمر یافت نشد.",
+                                                ephemeral=True)
         return
 
     start_date = datetime.fromisoformat(streamer.get("start_date"))
     days_since = (datetime.now(timezone.utc) - start_date).days
 
-    embed = discord.Embed(title=f"📋 پروفایل استریمر {user.name}", color=discord.Color.purple())
+    embed = discord.Embed(title=f"📋 پروفایل استریمر {user.name}",
+                          color=discord.Color.purple())
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.set_image(url=streamer.get("banner_url"))
-    embed.add_field(name="تعداد استریم‌ها", value=str(streamer.get("streams_count", 0)))
-    embed.add_field(name="تعداد تخلف‌ها", value=str(streamer.get("violations", 0)))
+    embed.add_field(name="تعداد استریم‌ها",
+                    value=str(streamer.get("streams_count", 0)))
+    embed.add_field(name="تعداد تخلف‌ها",
+                    value=str(streamer.get("violations", 0)))
     embed.add_field(name="لینک دعوت", value=streamer.get("invite_link"))
-    embed.add_field(name="میزان پول", value=f"{data.get('wallet', {}).get(uid, 0)} سکه")
+    embed.add_field(name="میزان پول",
+                    value=f"{data.get('wallet', {}).get(uid, 0)} سکه")
     embed.add_field(name="روز از استریمر شدن", value=f"{days_since} روز")
     embed.add_field(name="لینک استریم", value=streamer.get("stream_link"))
-    embed.add_field(name="تعداد دعوتی شما", value=str(streamer.get("invite_count", 0)))
+    embed.add_field(name="تعداد دعوتی شما",
+                    value=str(streamer.get("invite_count", 0)))
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 # -------------------------
 # نمایش لینک دعوت استریمر
@@ -122,18 +238,23 @@ async def pstream(interaction: Interaction, member: discord.Member = None):
 async def link(interaction: Interaction):
     uid = str(interaction.user.id)
     if not is_streamer(interaction.user):
-        await interaction.response.send_message("❌ شما استریمر نیستید.", ephemeral=True)
+        await interaction.response.send_message("❌ شما استریمر نیستید.",
+                                                ephemeral=True)
         return
     streamer = stream_data.get(uid)
     if not streamer:
-        await interaction.response.send_message("❌ اطلاعات استریمر یافت نشد.", ephemeral=True)
+        await interaction.response.send_message("❌ اطلاعات استریمر یافت نشد.",
+                                                ephemeral=True)
         return
-    await interaction.response.send_message(f"🌐 لینک دعوت شما: {streamer.get('invite_link')}", ephemeral=True)
+    await interaction.response.send_message(
+        f"🌐 لینک دعوت شما: {streamer.get('invite_link')}", ephemeral=True)
+
 
 # -------------------------
 # اضافه کردن استریمر توسط ادمین
 # -------------------------
 class AddStreamerModal(Modal):
+
     def __init__(self):
         super().__init__(title="ثبت استریمر")
         self.banner = TextInput(label="لینک بنر استریمر")
@@ -152,7 +273,8 @@ class AddStreamerModal(Modal):
         try:
             int(streamer_id)
         except:
-            await interaction.response.send_message("❌ ID استریمر معتبر نیست.", ephemeral=True)
+            await interaction.response.send_message("❌ ID استریمر معتبر نیست.",
+                                                    ephemeral=True)
             return
 
         stream_data[streamer_id] = {
@@ -166,19 +288,25 @@ class AddStreamerModal(Modal):
             "start_date": datetime.now(timezone.utc).isoformat()
         }
         await update_stream()
-        await interaction.response.send_message(f"✅ استریمر {streamer_id} ثبت شد.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ استریمر {streamer_id} ثبت شد.", ephemeral=True)
 
-@bot.tree.command(name="addstreamer", description="اضافه کردن استریمر (ادمین فقط)")
+
+@bot.tree.command(name="addstreamer",
+                  description="اضافه کردن استریمر (ادمین فقط)")
 async def addstreamer(interaction: Interaction):
     if not is_admin_member(interaction.user):
-        await interaction.response.send_message("❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
         return
     await interaction.response.send_modal(AddStreamerModal())
+
 
 # -------------------------
 # استارت استریم و افزایش پول و تعداد
 # -------------------------
 class StartStreamView(View):
+
     def __init__(self, streamer_id, news_channel: TextChannel):
         super().__init__()
         self.streamer_id = streamer_id
@@ -188,26 +316,29 @@ class StartStreamView(View):
     async def start_cb(self, interaction: Interaction, button: Button):
         streamer = stream_data.get(self.streamer_id)
         if not streamer:
-            await interaction.response.send_message("❌ اطلاعات استریمر یافت نشد.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ اطلاعات استریمر یافت نشد.", ephemeral=True)
             return
         uid = self.streamer_id
         # افزایش تعداد استریم
         streamer["streams_count"] = streamer.get("streams_count", 0) + 1
         # افزایش پول
-        data.setdefault("wallet", {})[uid] = data.get("wallet", {}).get(uid, 0) + 1000
+        data.setdefault("wallet",
+                        {})[uid] = data.get("wallet", {}).get(uid, 0) + 1000
         await update_data()
         await update_stream()
         # ارسال پیام در چنل اخبار
-        embed = discord.Embed(title="استارت استریم",
-                              description=f"استریمر <@{uid}> شروع به استریم کرده است!",
-                              color=discord.Color.green())
+        embed = discord.Embed(
+            title="استارت استریم",
+            description=f"استریمر <@{uid}> شروع به استریم کرده است!",
+            color=discord.Color.green())
         embed.set_image(url=streamer.get("banner_url"))
         embed.add_field(name="لینک استریم", value=streamer.get("stream_link"))
         await self.news_channel.send(embed=embed)
-        await interaction.response.send_message("✅ استریم شروع شد و پول اضافه شد.", ephemeral=True)
+        await interaction.response.send_message(
+            "✅ استریم شروع شد و پول اضافه شد.", ephemeral=True)
         self.stop()
 
-data = load_data()
 
 user_wallet = data.get("wallet", {})
 user_subscription = data.get("subscription", {})
@@ -220,21 +351,6 @@ server_settings = data.get("server_settings", {})
 active_timers = {}  # user_id -> message
 active_contest_tasks = {}  # contest_id -> task
 
-
-async def save_data_async():
-    async with file_lock:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-async def update_data():
-    data["wallet"] = user_wallet
-    data["subscription"] = user_subscription
-    data["warns"] = user_warns
-    data["badges"] = user_badges
-    data["contests"] = contests
-    data["server_settings"] = server_settings
-    await save_data_async()
 
 
 # -------------------------
@@ -268,7 +384,9 @@ def mask_code(code: str):
 # ویرایش اطلاعات استریمر
 # -------------------------
 
+
 class EditStreamerModal(Modal):
+
     def __init__(self, streamer_id, field_name):
         super().__init__(title=f"ویرایش {field_name}")
         self.streamer_id = streamer_id
@@ -279,7 +397,8 @@ class EditStreamerModal(Modal):
     async def on_submit(self, interaction: Interaction):
         streamer = stream_data.get(self.streamer_id)
         if not streamer:
-            await interaction.response.send_message("❌ استریمر یافت نشد.", ephemeral=True)
+            await interaction.response.send_message("❌ استریمر یافت نشد.",
+                                                    ephemeral=True)
             return
 
         value = self.input_field.value.strip()
@@ -287,57 +406,77 @@ class EditStreamerModal(Modal):
             try:
                 value = int(value)
             except:
-                await interaction.response.send_message("❌ مقدار عددی معتبر نیست.", ephemeral=True)
+                await interaction.response.send_message(
+                    "❌ مقدار عددی معتبر نیست.", ephemeral=True)
                 return
         streamer[self.field_name] = value
         await update_stream()
-        await interaction.response.send_message(f"✅ {self.field_name} بروزرسانی شد.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ {self.field_name} بروزرسانی شد.", ephemeral=True)
 
 
-
-
-
-@bot.tree.command(name="vstream", description="لیست استریمرها و ویرایش اطلاعات (ادمین فقط)")
+@bot.tree.command(name="vstream",
+                  description="لیست استریمرها و ویرایش اطلاعات (ادمین فقط)")
 async def vstream(interaction: Interaction):
     if not is_admin_member(interaction.user):
-        await interaction.response.send_message("❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
         return
 
     view = View()
     for uid, streamer in stream_data.items():
+        if not uid.isdigit():
+            continue
         user = bot.get_user(int(uid))
         label = user.name if user else uid
         btn = Button(label=label, style=discord.ButtonStyle.blurple)
+
         async def button_callback(btn_interaction, streamer_id=uid):
-            fields = ["banner_url", "invite_link", "stream_link", "streams_count", "violations", "invite_count"]
+            fields = [
+                "banner_url", "invite_link", "stream_link", "streams_count",
+                "violations", "invite_count"
+            ]
             field_view = View()
             for field in fields:
                 fbtn = Button(label=field, style=discord.ButtonStyle.gray)
+
                 async def fbtn_cb(i, field_name=field, sid=streamer_id):
-                    await i.response.send_modal(EditStreamerModal(sid, field_name))
+                    await i.response.send_modal(
+                        EditStreamerModal(sid, field_name))
+
                 fbtn.callback = fbtn_cb
                 field_view.add_item(fbtn)
-            await btn_interaction.response.send_message(f"📋 ویرایش اطلاعات {streamer.get('banner_url')}", view=field_view, ephemeral=True)
+            await btn_interaction.response.send_message(
+                f"📋 ویرایش اطلاعات {streamer.get('banner_url')}",
+                view=field_view,
+                ephemeral=True)
+
         btn.callback = button_callback
         view.add_item(btn)
 
-    await interaction.response.send_message("لیست استریمرها:", view=view, ephemeral=True)
+    await interaction.response.send_message("لیست استریمرها:",
+                                            view=view,
+                                            ephemeral=True)
+
 
 # -------------------------
 # تنظیم کانال استریم
 # -------------------------
 
-@bot.tree.command(name="sets", description="ارسال پیام استارت استریم با دکمه برای استریمرها")
+
+@bot.tree.command(
+    name="sets", description="ارسال پیام استارت استریم با دکمه برای استریمرها")
 async def sets(interaction: discord.Interaction, channel: discord.TextChannel):
     if not is_admin_member(interaction.user):
-        await interaction.response.send_message("❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
         return
 
     embed = discord.Embed(
         title="استارت استریم",
-        description="من استریمر هستم و قوانین را قبول دارم.\nبرای شروع استریم روی دکمه زیر کلیک کنید.",
-        color=discord.Color.green()
-    )
+        description=
+        "من استریمر هستم و قوانین را قبول دارم.\nبرای شروع استریم روی دکمه زیر کلیک کنید.",
+        color=discord.Color.green())
 
     view = StartStreamView()
     msg = await channel.send(embed=embed, view=view)
@@ -354,36 +493,45 @@ async def sets(interaction: discord.Interaction, channel: discord.TextChannel):
         }
 
     await update_stream()
-    await interaction.response.send_message(f"✅ پیام استارت استریم ارسال شد در {channel.mention}", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ پیام استارت استریم ارسال شد در {channel.mention}", ephemeral=True)
 
 
 # -------------------------
 # دکمه استارت استریم
 # -------------------------
 
+
 class StartStreamView(View):
+
     def __init__(self):
         super().__init__(timeout=None)  # Persistent view
 
-    @discord.ui.button(label="استارت استریم", style=discord.ButtonStyle.green, custom_id="start_stream_button")
-    async def start_stream(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="استارت استریم",
+                       style=discord.ButtonStyle.green,
+                       custom_id="start_stream_button")
+    async def start_stream(self, interaction: discord.Interaction,
+                           button: discord.ui.Button):
         user = interaction.user
         uid = str(user.id)
 
         # چک کردن رول استریمر
         if not is_streamer(user):
-            await interaction.response.send_message("❌ شما استریمر نیستید.", ephemeral=True)
+            await interaction.response.send_message("❌ شما استریمر نیستید.",
+                                                    ephemeral=True)
             return
 
         # گرفتن اطلاعات استریمر
         streamer = stream_data.get(uid)
         if not streamer:
-            await interaction.response.send_message("❌ اطلاعات استریمر یافت نشد.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ اطلاعات استریمر یافت نشد.", ephemeral=True)
             return
 
         # افزایش تعداد استریم و پول
         streamer["streams_count"] = streamer.get("streams_count", 0) + 1
-        data.setdefault("wallet", {})[uid] = data.get("wallet", {}).get(uid, 0) + 1000
+        data.setdefault("wallet",
+                        {})[uid] = data.get("wallet", {}).get(uid, 0) + 1000
         await update_data()
         await update_stream()
 
@@ -391,51 +539,64 @@ class StartStreamView(View):
         guild_id = str(interaction.guild.id)
         guild_info = stream_data.get("start_stream_messages", {}).get(guild_id)
         if not guild_info or not guild_info.get("channel_id"):
-            await interaction.response.send_message("❌ کانال اخبار استارت استریم ثبت نشده.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ کانال اخبار استارت استریم ثبت نشده.", ephemeral=True)
             return
 
         news_channel = bot.get_channel(guild_info["channel_id"])
         if not news_channel:
-            await interaction.response.send_message("❌ کانال اخبار یافت نشد.", ephemeral=True)
+            await interaction.response.send_message("❌ کانال اخبار یافت نشد.",
+                                                    ephemeral=True)
             return
 
         # ارسال پیام اطلاع‌رسانی در کانال اخبار
         embed = discord.Embed(
             title="استریم شروع شد!",
-            description=f"استریمر {user.mention} شروع به استریم کرده است!\nتو هنوز نشستی و بیکاری؟ بیا تو استریم یکم حال کنیم!",
-            color=discord.Color.blurple()
-        )
+            description=
+            f"استریمر {user.mention} شروع به استریم کرده است!\nتو هنوز نشستی و بیکاری؟ بیا تو استریم یکم حال کنیم!",
+            color=discord.Color.blurple())
         embed.set_image(url=streamer.get("banner_url"))
-        embed.add_field(name="لینک استریم", value=streamer.get("stream_link"), inline=False)
-        embed.add_field(name="پیام پایانی", value="منتظرت تو استریم هستم!", inline=False)
+        embed.add_field(name="لینک استریم",
+                        value=streamer.get("stream_link"),
+                        inline=False)
+        embed.add_field(name="پیام پایانی",
+                        value="منتظرت تو استریم هستم!",
+                        inline=False)
 
         view = View()
-        enter_button = Button(label="ورود به استریمر", style=discord.ButtonStyle.link, url=streamer.get("stream_link"))
+        enter_button = Button(label="ورود به استریمر",
+                              style=discord.ButtonStyle.link,
+                              url=streamer.get("stream_link"))
         view.add_item(enter_button)
 
         await news_channel.send(embed=embed, view=view)
-        await interaction.response.send_message("✅ استریم شما شروع شد و پیام اطلاع‌رسانی ارسال شد.", ephemeral=True)
+        await interaction.response.send_message(
+            "✅ استریم شما شروع شد و پیام اطلاع‌رسانی ارسال شد.",
+            ephemeral=True)
 
 
 # -------------------------
 # تنظیم پیام
 # -------------------------
 
+
 # وقتی می‌خوای پیام استارت را بفرستی
 @bot.tree.command(name="start_msg", description="ارسال پیام استارت استریم")
 async def start_msg(interaction: Interaction):
     gid = str(interaction.guild.id)
-    news_channel_id = server_settings.get(gid, {}).get("stream_news_channel_id")
+    news_channel_id = server_settings.get(gid,
+                                          {}).get("stream_news_channel_id")
     news_channel = bot.get_channel(news_channel_id)
     if not news_channel:
-        await interaction.response.send_message("❌ کانال اخبار استارت استریم تنظیم نشده است.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ کانال اخبار استارت استریم تنظیم نشده است.", ephemeral=True)
         return
 
     embed = discord.Embed(
         title="استارت استریم",
-        description="من استریمر هستم و قوانین را قبول دارم.\nبرای استارت استریم روی دکمه زیر کلیک کنید.",
-        color=discord.Color.green()
-    )
+        description=
+        "من استریمر هستم و قوانین را قبول دارم.\nبرای استارت استریم روی دکمه زیر کلیک کنید.",
+        color=discord.Color.green())
     view = StartStreamView(news_channel)
     await interaction.response.send_message(embed=embed, view=view)
 
@@ -444,10 +605,14 @@ async def start_msg(interaction: Interaction):
 # تنظیم کانال استارت استریم
 # -------------------------
 
-@bot.tree.command(name="setstart", description="تنظیم کانال اخبار استارت استریم (ادمین فقط)")
-async def setstart(interaction: discord.Interaction, channel: discord.TextChannel):
+
+@bot.tree.command(name="setstart",
+                  description="تنظیم کانال اخبار استارت استریم (ادمین فقط)")
+async def setstart(interaction: discord.Interaction,
+                   channel: discord.TextChannel):
     if not is_admin_member(interaction.user):
-        await interaction.response.send_message("❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
         return
 
     guild_id = str(interaction.guild.id)
@@ -460,19 +625,25 @@ async def setstart(interaction: discord.Interaction, channel: discord.TextChanne
     }
     await update_stream()
 
-    await interaction.response.send_message(f"✅ کانال اخبار استارت استریم تنظیم شد: {channel.mention}", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ کانال اخبار استارت استریم تنظیم شد: {channel.mention}",
+        ephemeral=True)
+
 
 # -------------------------
 # سیستم ارسال استریم
 # -------------------------
+
 
 async def send_start_stream_message(user: discord.Member):
     uid = str(user.id)
     if not is_streamer(user):
         return
     gid = str(user.guild.id)
-    news_channel_id = server_settings.get(gid, {}).get("stream_news_channel_id")
-    start_channel_id = server_settings.get(gid, {}).get("stream_start_channel_id")
+    news_channel_id = server_settings.get(gid,
+                                          {}).get("stream_news_channel_id")
+    start_channel_id = server_settings.get(gid,
+                                           {}).get("stream_start_channel_id")
     news_channel = bot.get_channel(news_channel_id)
     start_channel = bot.get_channel(start_channel_id)
     if not start_channel:
@@ -483,25 +654,30 @@ async def send_start_stream_message(user: discord.Member):
 
     embed = discord.Embed(
         title="استارت استریم",
-        description="من استریمر هستم و قوانین را قبول دارم.\nبرای شروع استریم روی دکمه زیر کلیک کنید.",
-        color=discord.Color.green()
-    )
+        description=
+        "من استریمر هستم و قوانین را قبول دارم.\nبرای شروع استریم روی دکمه زیر کلیک کنید.",
+        color=discord.Color.green())
     embed.set_image(url=streamer.get("banner_url"))
     await start_channel.send(embed=embed, view=view)
+
 
 # -------------------------
 # تخلفات استریمر
 # -------------------------
 
+
 @bot.tree.command(name="ws", description="مدیریت تخلفات استریمر (ادمین فقط)")
 @app_commands.describe(member="استریمر", number="تعداد", action="add/rev")
-async def ws(interaction: Interaction, member: discord.Member, number: int, action: str):
+async def ws(interaction: Interaction, member: discord.Member, number: int,
+             action: str):
     if not is_admin_member(interaction.user):
-        await interaction.response.send_message("❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ فقط ادمین‌ها می‌توانند این فرمان را اجرا کنند.", ephemeral=True)
         return
     uid = str(member.id)
     if uid not in stream_data:
-        await interaction.response.send_message("❌ این کاربر استریمر نیست.", ephemeral=True)
+        await interaction.response.send_message("❌ این کاربر استریمر نیست.",
+                                                ephemeral=True)
         return
 
     streamer = stream_data[uid]
@@ -510,21 +686,28 @@ async def ws(interaction: Interaction, member: discord.Member, number: int, acti
     elif action.lower() == "rev":
         streamer["violations"] = max(0, streamer.get("violations", 0) - number)
     else:
-        await interaction.response.send_message("❌ action باید add یا rev باشد.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ action باید add یا rev باشد.", ephemeral=True)
         return
 
     await update_stream()
-    await interaction.response.send_message(f"✅ تعداد تخلفات بروزرسانی شد: {streamer['violations']}", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ تعداد تخلفات بروزرسانی شد: {streamer['violations']}",
+        ephemeral=True)
+
 
 # -------------------------
 # دعوت لینک
 # -------------------------
 
+
 class AddStreamerModal(Modal):
+
     def __init__(self):
         super().__init__(title="ثبت استریمر")
         # ورودی‌ها
-        self.user_id_input = TextInput(label="ID استریمر")  # این می‌شود streamer_id
+        self.user_id_input = TextInput(
+            label="ID استریمر")  # این می‌شود streamer_id
         self.banner = TextInput(label="لینک بنر استریمر")
         self.invite_link = TextInput(label="لینک دعوت استریمر")
         self.stream_link = TextInput(label="لینک استریم شما")
@@ -538,7 +721,8 @@ class AddStreamerModal(Modal):
         # مقدار streamer_id را از input کاربر می‌گیریم
         streamer_id = self.user_id_input.value.strip()
         if not streamer_id.isdigit():
-            await interaction.response.send_message("❌ ID معتبر نیست.", ephemeral=True)
+            await interaction.response.send_message("❌ ID معتبر نیست.",
+                                                    ephemeral=True)
             return
 
         # ثبت اطلاعات در stream_data
@@ -555,15 +739,18 @@ class AddStreamerModal(Modal):
         }
 
         await update_stream()
-        await interaction.response.send_message(f"✅ استریمر {streamer_id} ثبت شد.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ استریمر {streamer_id} ثبت شد.", ephemeral=True)
 
 
 async def save_user_data():
     await update_data()
 
+
 # -------------------------
 # مدیریت ورود کاربران
 # -------------------------
+
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -588,8 +775,11 @@ async def on_member_join(member: discord.Member):
             for sid, streamer in stream_data.items():
                 if used_invite.code == streamer.get("invite_code"):
                     # افزایش پول و تعداد دعوتی
-                    data.setdefault("wallet", {})[sid] = data.get("wallet", {}).get(sid, 0) + 1000
-                    streamer["invite_count"] = streamer.get("invite_count", 0) + 1
+                    data.setdefault(
+                        "wallet",
+                        {})[sid] = data.get("wallet", {}).get(sid, 0) + 1000
+                    streamer["invite_count"] = streamer.get("invite_count",
+                                                            0) + 1
                     await update_data()
                     await update_stream()
                     break
@@ -606,16 +796,11 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
-    # بارگذاری Persistent Views برای استارت استریم
-    for guild_id, info in stream_data.get("start_stream_messages", {}).items():
-        channel = bot.get_channel(info["channel_id"])
-        if channel:
-            try:
-                msg = await channel.fetch_message(info["message_id"])
-                view = StartStreamView()
-                bot.add_view(view, message_id=msg.id)  # دکمه‌ها دوباره فعال می‌شوند
-            except Exception as e:
-                print(f"⚠️ بارگذاری پیام استارت استریم برای سرور {guild_id} ممکن نیست: {e}")
+    try:
+        await bot.tree.sync()  # این خط فرمان‌ها را به Discord ارسال می‌کند
+        print("✅ Tree synced")
+    except Exception as e:
+        print(f"⚠️ مشکل در sync کردن tree: {e}")
 
 
 @bot.event
@@ -629,17 +814,6 @@ async def on_member_join(member: discord.Member):
         await member.edit(nick=f"{user_badges[uid]} | {member.name}")
     except Exception:
         pass
-
-
-@bot.event
-async def on_member_remove(member: discord.Member):
-    uid = str(member.id)
-    user_wallet.pop(uid, None)
-    user_subscription.pop(uid, None)
-    user_warns.pop(uid, None)
-    user_badges.pop(uid, None)
-    await update_data()
-    print(f"🧹 Removed data for {member} (left server)")
 
 
 # -------------------------
@@ -676,14 +850,23 @@ async def pol(interaction: discord.Interaction):
 async def prof(interaction: discord.Interaction):
     user = interaction.user
     uid = str(user.id)
-    badge = user_badges.get(uid, "ثبت نشده")
-    coins = user_wallet.get(uid, 0)
-    warns = user_warns.get(uid, 0)
+
+    # خواندن جدید از فایل
+    d = load_data()
+
+    user_wallet_data = d.get("wallet", {})
+    user_subscription_data = d.get("subscription", {})
+    user_warns_data = d.get("warns", {})
+    user_badges_data = d.get("badges", {})
+
+    badge = user_badges_data.get(uid, "ثبت نشده")
+    coins = user_wallet_data.get(uid, 0)
+    warns = user_warns_data.get(uid, 0)
 
     sub_status = "❌ ندارد"
     days_left = "—"
-    if uid in user_subscription:
-        start = datetime.fromisoformat(user_subscription[uid])
+    if uid in user_subscription_data:
+        start = datetime.fromisoformat(user_subscription_data[uid])
         end = start + timedelta(days=30)
         now = datetime.now(timezone.utc)
         remaining = end - now
@@ -708,68 +891,6 @@ async def prof(interaction: discord.Interaction):
     embed.set_footer(text="اطلاعات پروفایل شما")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# -------------------------
-# فروشگاه ساده (/shop) — همون‌طور که بود
-# -------------------------
-@bot.tree.command(name="shop", description="خرید اشتراک شکرسیتی")
-async def shop(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🛍 فروشگاه شکرسیتی",
-        description=
-        "🎫 اشتراک 1 ماه شکرسیتی\n💰 قیمت: 75000 سکه\n📦 رول دریافتی: `sub (1)`\n⏳ اعتبار: 30 روز",
-        color=discord.Color.gold())
-    embed.set_footer(text="برای خرید روی دکمه زیر کلیک کنید")
-
-    view = View()
-    button = Button(label="خرید اشتراک", style=discord.ButtonStyle.green)
-
-    async def button_callback(btn_interaction: discord.Interaction):
-        uid = str(btn_interaction.user.id)
-        balance = user_wallet.get(uid, 0)
-        if balance < 75000:
-            await btn_interaction.response.send_message("❌ موجودی کافی نیست!",
-                                                        ephemeral=True)
-            return
-        user_wallet[uid] = balance - 75000
-        user_subscription[uid] = datetime.now(timezone.utc).isoformat()
-        await update_data()
-        role = discord.utils.get(btn_interaction.guild.roles, name="sub (1)")
-        if role:
-            try:
-                await btn_interaction.user.add_roles(role)
-            except Exception:
-                pass
-            await btn_interaction.response.send_message(
-                "✅ اشتراک خریداری شد! رول `sub (1)` به شما داده شد.",
-                ephemeral=True)
-            bot.loop.create_task(
-                schedule_role_removal(btn_interaction.user, role, days=30))
-        else:
-            await btn_interaction.response.send_message(
-                "❌ رول `sub (1)` پیدا نشد. لطفاً رول را بسازید.",
-                ephemeral=True)
-
-    button.callback = button_callback
-    view.add_item(button)
-
-    await interaction.response.send_message(embed=embed,
-                                            view=view,
-                                            ephemeral=True)
-
-
-async def schedule_role_removal(member: discord.Member,
-                                role: discord.Role,
-                                days: int = 30):
-    await asyncio.sleep(days * 24 * 60 * 60)
-    try:
-        await member.remove_roles(role)
-        await member.send(
-            "⏳ اشتراک شما به پایان رسید و رول `sub (1)` از شما گرفته شد.")
-    except Exception:
-        pass
-
 
 # -------------------------
 # تایمر 20 روزه: تابع اجرایی قابل فراخوانی
@@ -879,137 +1000,132 @@ async def rtime_cmd(interaction: discord.Interaction,
 # -------------------------
 # دستورات پرداخت (/pay)
 # -------------------------
-@bot.tree.command(name="pay",
-                  description="افزودن یا کم کردن پول از کاربر (admin فقط)")
-@app_commands.describe(member="کاربر هدف",
-                       amount="مقدار (عدد صحیح)",
-                       action="add یا rev")
-async def pay_cmd(interaction: discord.Interaction, member: discord.Member,
-                  amount: int, action: str):
+@bot.tree.command(name="pay", description="افزودن یا کم کردن پول از کاربر (admin فقط)")
+@app_commands.describe(member="کاربر هدف", amount="مقدار (عدد صحیح)", action="add یا rev")
+async def pay_cmd(interaction: discord.Interaction, member: discord.Member, amount: int, action: str):
     if not is_admin_member(interaction.user):
-        await interaction.response.send_message(
-            "❌ فقط ادمین‌ها می‌تونن این فرمان رو اجرا کنن.", ephemeral=True)
+        await interaction.response.send_message("❌ فقط ادمین‌ها می‌تونن این فرمان رو اجرا کنن.", ephemeral=True)
         return
-    uid = str(member.id)
-    user_wallet[uid] = user_wallet.get(uid, 0)
-    if action.lower() == "add":
-        user_wallet[uid] += amount
-        await update_data()
-        await interaction.response.send_message(
-            f"✅ {amount} سکه به {member.mention} اضافه شد.", ephemeral=True)
-    elif action.lower() == "rev":
-        user_wallet[uid] = max(0, user_wallet[uid] - amount)
-        await update_data()
-        await interaction.response.send_message(
-            f"✅ {amount} سکه از {member.mention} کسر شد.", ephemeral=True)
-    else:
-        await interaction.response.send_message(
-            "❌ پارامتر action باید `add` یا `rev` باشد.", ephemeral=True)
 
+    uid = str(member.id)
+
+    # ✅ لود فایل اصلی
+    d = load_data()
+    wallets = d.setdefault("wallet", {})
+
+    # گرفتن موجودی فعلی
+    current = wallets.get(uid, 0)
+
+    if action.lower() == "add":
+        wallets[uid] = current + amount
+        msg = f"✅ {amount} سکه به {member.mention} اضافه شد. (کل: {wallets[uid]})"
+    elif action.lower() == "rev":
+        wallets[uid] = max(0, current - amount)
+        msg = f"✅ {amount} سکه از {member.mention} کم شد. (کل: {wallets[uid]})"
+    else:
+        await interaction.response.send_message("❌ پارامتر action باید `add` یا `rev` باشد.", ephemeral=True)
+        return
+
+    # ✅ ذخیره در فایل
+    await save_data_async(d)
+
+    await interaction.response.send_message(msg, ephemeral=True)
 
 # -------------------------
 # وارن‌ها: /w (add/rev), /wr (reset), /wv (view)
 # -------------------------
-@bot.tree.command(name="w",
-                  description="افزودن یا حذف وارن به کاربر (admin فقط)")
-@app_commands.describe(member="کاربر هدف",
-                       count="تعداد (مثال: 1)",
-                       action="add یا rev")
-async def w_cmd(interaction: discord.Interaction, member: discord.Member,
-                count: int, action: str):
+# -------------------------
+# وارن‌ها (دائمی در فایل data.json)
+# -------------------------
+@bot.tree.command(name="w", description="افزودن یا حذف وارن به کاربر (admin فقط)")
+@app_commands.describe(member="کاربر هدف", count="تعداد (مثال: 1)", action="add یا rev")
+async def w_cmd(interaction: discord.Interaction, member: discord.Member, count: int, action: str):
     if not is_admin_member(interaction.user):
-        await interaction.response.send_message(
-            "❌ فقط ادمین‌ها می‌تونن این فرمان رو اجرا کنن.", ephemeral=True)
+        await interaction.response.send_message("❌ فقط ادمین‌ها می‌تونن این فرمان رو اجرا کنن.", ephemeral=True)
         return
-    uid = str(member.id)
-    user_warns[uid] = user_warns.get(uid, 0)
-    if action.lower() == "add":
-        user_warns[uid] += count
-        await update_data()
-        await interaction.response.send_message(
-            f"⚠️ به {member.mention}، {count} وارن افزوده شد. (تعداد فعلی: {user_warns[uid]})",
-            ephemeral=True)
-    elif action.lower() == "rev":
-        user_warns[uid] = max(0, user_warns[uid] - count)
-        await update_data()
-        # اگر زیر 3 شد، برداشتن تایم‌اوت
-        if user_warns[uid] < 3:
-            try:
-                await member.edit(communication_disabled_until=None)
-            except Exception:
-                pass
-        await interaction.response.send_message(
-            f"✅ {count} وارن از {member.mention} حذف شد. (تعداد فعلی: {user_warns[uid]})",
-            ephemeral=True)
-    else:
-        await interaction.response.send_message(
-            "❌ پارامتر action باید `add` یا `rev` باشد.", ephemeral=True)
 
-    # اعمال خودکار (بعد از update_data)
-    # اگر وارن برابر یا بیشتر از 3 => 1 هفته mute (timeout)
-    if user_warns.get(uid, 0) >= 3 and user_warns.get(uid, 0) < 5:
-        # اگر فعلاً تایم‌اوت اعمال نشده باشه، اعمال کن
+    uid = str(member.id)
+
+    # ✅ خواندن داده از فایل
+    d = load_data()
+    warns = d.setdefault("warns", {})
+
+    current_warns = warns.get(uid, 0)
+
+    # ✅ افزودن یا کم کردن
+    if action.lower() == "add":
+        current_warns += count
+        warns[uid] = current_warns
+        msg = f"⚠️ {count} وارن به {member.mention} اضافه شد. (تعداد فعلی: {current_warns})"
+    elif action.lower() == "rev":
+        current_warns = max(0, current_warns - count)
+        warns[uid] = current_warns
+        msg = f"✅ {count} وارن از {member.mention} حذف شد. (تعداد فعلی: {current_warns})"
+    else:
+        await interaction.response.send_message("❌ پارامتر action باید `add` یا `rev` باشد.", ephemeral=True)
+        return
+
+    # ✅ ذخیره در فایل
+    await save_data_async(d)
+
+    # قوانین خودکار
+    if current_warns >= 3 and current_warns < 5:
         try:
-            # timeout until now + 7 days
             until = datetime.now(timezone.utc) + timedelta(days=7)
             await member.edit(communication_disabled_until=until)
-            # پیام اطلاع‌رسانی در کانالی که فرمان اجرا شد
-            try:
-                await interaction.channel.send(
-                    f"🔇 {member.mention} به‌خاطر رسیدن به {user_warns[uid]} وارن برای ۱ هفته سکوت شد."
-                )
-            except Exception:
-                pass
+            await interaction.channel.send(
+                f"🔇 {member.mention} به‌خاطر رسیدن به {current_warns} وارن برای ۱ هفته سکوت شد.")
         except Exception:
             pass
-    # اگر وارن >=5 => ban دائم
-    if user_warns.get(uid, 0) >= 5:
+    elif current_warns >= 5:
         try:
-            await member.ban(reason="دریافت 5 وارن - بن دائم",
-                             delete_message_days=0)
-            try:
-                await interaction.channel.send(
-                    f"🔨 {member.mention} به دلیل رسیدن به 5 وارن بن شد (دائم)."
-                )
-            except Exception:
-                pass
+            await member.ban(reason="دریافت 5 وارن - بن دائم", delete_message_days=0)
+            await interaction.channel.send(f"🔨 {member.mention} به دلیل رسیدن به 5 وارن بن شد (دائم).")
         except Exception:
             pass
 
+    await interaction.response.send_message(msg, ephemeral=True)
 
-@bot.tree.command(name="wr",
-                  description="پاک کردن تمام وارن‌های کاربر (admin فقط)")
+
+# -------------------------
+# حذف تمام وارن‌ها
+# -------------------------
+@bot.tree.command(name="wr", description="پاک کردن تمام وارن‌های کاربر (admin فقط)")
 @app_commands.describe(member="کاربر هدف")
 async def wr_cmd(interaction: discord.Interaction, member: discord.Member):
     if not is_admin_member(interaction.user):
-        await interaction.response.send_message(
-            "❌ فقط ادمین‌ها می‌تونن این فرمان رو اجرا کنن.", ephemeral=True)
+        await interaction.response.send_message("❌ فقط ادمین‌ها می‌تونن این فرمان رو اجرا کنن.", ephemeral=True)
         return
+
     uid = str(member.id)
-    user_warns[uid] = 0
-    await update_data()
-    # برداشتن تایم‌اوت اگر وجود داشت
+    d = load_data()
+    warns = d.setdefault("warns", {})
+    warns[uid] = 0
+    await save_data_async(d)
+
     try:
         await member.edit(communication_disabled_until=None)
     except Exception:
         pass
-    await interaction.response.send_message(
-        f"✅ تمام وارن‌های {member.mention} پاک شد.", ephemeral=True)
+
+    await interaction.response.send_message(f"✅ تمام وارن‌های {member.mention} پاک شد.", ephemeral=True)
 
 
-@bot.tree.command(name="wv",
-                  description="نمایش تعداد وارن‌های کاربر (admin فقط)")
+# -------------------------
+# مشاهده تعداد وارن‌ها
+# -------------------------
+@bot.tree.command(name="wv", description="نمایش تعداد وارن‌های کاربر (admin فقط)")
 @app_commands.describe(member="کاربر مورد نظر")
 async def wv_cmd(interaction: discord.Interaction, member: discord.Member):
     if not is_admin_member(interaction.user):
-        await interaction.response.send_message(
-            "❌ فقط ادمین‌ها می‌تونن این فرمان رو اجرا کنن.", ephemeral=True)
+        await interaction.response.send_message("❌ فقط ادمین‌ها می‌تونن این فرمان رو اجرا کنن.", ephemeral=True)
         return
-    uid = str(member.id)
-    count = user_warns.get(uid, 0)
-    await interaction.response.send_message(
-        f"⚠️ {member.mention} دارای {count} وارن است.", ephemeral=True)
 
+    uid = str(member.id)
+    d = load_data()
+    warns = d.get("warns", {})
+    count = warns.get(uid, 0)
+    await interaction.response.send_message(f"⚠️ {member.mention} دارای {count} وارن است.", ephemeral=True)
 
 # -------------------------
 # سیستم مسابقات (plus, setgame, setout, participation)
@@ -1582,9 +1698,626 @@ async def auto_ban_after_warn(uid: str, member: discord.Member):
         except Exception as e:
             print(f"⚠️ خطا در بن کردن {member}: {e}")
 
+
+# -------------------------
+# فروشگاه ربات
+# -------------------------
+
+
+# -------------------------
+# Subscription & shoprole management
+# -------------------------
+async def create_and_assign_custom_role(guild: discord.Guild,
+                                        member: discord.Member):
+    """
+    Create a role named '<lowername> ####' with no permissions, assign it to member,
+    and save in data['shoprole'].
+    """
+    global data
+    uid = str(member.id)
+    base = member.name.split("#")[0].lower()
+    code = generate_4digits()
+    role_name = f"{base} {code}"
+    try:
+        role = await guild.create_role(name=role_name,
+                                       permissions=discord.Permissions.none(),
+                                       reason=f"Custom shop role for {uid}")
+        # save
+        data_cache = load_data()
+        data.setdefault("shoprole", {})[uid] = {
+            "role_id": str(role.id),
+            "guild_id": str(guild.id),
+            "start_date": datetime.now(timezone.utc).isoformat()
+        }
+        await save_data_async(data)
+        # give role
+        try:
+            await member.add_roles(role, reason="Bought custom shop role")
+        except Exception:
+            pass
+        # notify admins in this guild
+        for m in guild.members:
+            if is_admin_member(m):
+                try:
+                    await m.send(
+                        f"📢 کاربر {member.mention} در سرور **{guild.name}** رول اختصاصی خرید کرد.\nرول: `{role.name}`"
+                    )
+                except Exception:
+                    pass
+        return role
+    except Exception as e:
+        print("Error creating custom role:", e)
+        return None
+
+
+# -------------------------
+# حذف رول اختصاصی و پاکسازی از data.json
+# -------------------------
+async def remove_custom_role_for_user(uid: str):
+    global data, data_cache
+    try:
+        d = load_data()
+        entry = d.get("shoprole", {}).get(uid)
+        if not entry:
+            return
+
+        guild = bot.get_guild(int(entry["guild_id"]))
+        if not guild:
+            return
+
+        role = guild.get_role(int(entry["role_id"]))
+        member = guild.get_member(int(uid))
+
+        if member and role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Custom role expired")
+            except Exception as e:
+                print(f"[remove_custom_role_for_user] حذف رول از ممبر: {e}")
+
+        if role:
+            try:
+                await role.delete(reason="Custom role expired")
+            except Exception as e:
+                print(f"[remove_custom_role_for_user] حذف رول از سرور: {e}")
+
+        # حذف از data و هماهنگ‌سازی کامل
+        if uid in d.get("shoprole", {}):
+            del d["shoprole"][uid]
+
+        # ذخیره و هماهنگ‌سازی حافظه
+        await save_data_async(d)
+        data = d
+        data_cache = d
+
+        print(f"✅ shoprole برای {uid} حذف شد و فایل ذخیره شد.")
+
+        if member:
+            try:
+                await member.send("🎫 رول اختصاصی شما منقضی شد و حذف گردید.")
+            except:
+                pass
+
+    except Exception as e:
+        print(f"⚠️ خطا در remove_custom_role_for_user: {e}")
+
+# -------------------------
+# بررسی اشتراک‌ها و رول‌ها هر ۱ دقیقه
+# -------------------------
+async def check_subscriptions_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            global data_cache
+            data_cache = load_data()
+            now = datetime.now(timezone.utc)
+            updated = False
+
+            # 🕒 بررسی اشتراک معمولی
+            subs = data_cache.get("subscription", {})
+            expired_subs = []
+            for uid, start_date in list(subs.items()):
+                try:
+                    start = datetime.fromisoformat(start_date)
+                except Exception:
+                    continue
+                if now - start >= timedelta(days=30):
+                    expired_subs.append(uid)
+
+            for uid in expired_subs:
+                subs.pop(uid, None)
+                updated = True
+                for guild in bot.guilds:
+                    member = guild.get_member(int(uid))
+                    if member:
+                        role = discord.utils.get(guild.roles, name="sub (1)")
+                        if role and role in member.roles:
+                            await member.remove_roles(role, reason="Subscription expired")
+                        try:
+                            await member.send("⏳ اشتراک معمولی شما منقضی شد.")
+                        except:
+                            pass
+
+            # 🕒 بررسی رول اختصاصی
+            shoprole = data_cache.get("shoprole", {})
+            expired_roles = []
+            for uid, info in list(shoprole.items()):
+                try:
+                    start = datetime.fromisoformat(info["start_date"])
+                except Exception:
+                    continue
+                if now - start >= timedelta(days=30):
+                    expired_roles.append(uid)
+
+            for uid in expired_roles:
+                await remove_custom_role_for_user(uid)
+                updated = True
+
+            if updated:
+                await save_data_async(data_cache)
+                print("✅ داده‌ها به‌روزرسانی و ذخیره شدند.")
+
+        except Exception as e:
+            print("⚠️ Error in check_subscriptions_loop:", e)
+        
+        data = data_cache
+
+        await asyncio.sleep(60)
+# -------------------------
+# Shop UI and flows
+# -------------------------
+PRICE_SUB = 75000
+PRICE_ROLE_CUSTOM = 1000000
+
+
+class ConfirmBuyView(View):
+
+    def __init__(self, product_name, price):
+        super().__init__(timeout=60)
+        self.product_name = product_name
+        self.price = price
+
+    @discord.ui.button(label="✅ بله", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: Interaction, button: Button):
+        uid = str(interaction.user.id)
+        d = load_data()
+        wallets = d.setdefault("wallet", {})
+        bal = wallets.get(uid, 0)
+        if bal < self.price:
+            await interaction.response.send_message("❌ موجودی شما کافی نیست.",
+                                                    ephemeral=True)
+            return
+        wallets[uid] = bal - self.price
+        d["wallet"] = wallets
+        # perform purchase
+        if self.product_name == "اشتراک 1 ماهه":
+            d.setdefault("subscription",
+                         {})[uid] = datetime.now(timezone.utc).isoformat()
+            # give role if exists
+            role = discord.utils.get(interaction.guild.roles, name="sub (1)")
+            if role:
+                try:
+                    await interaction.user.add_roles(role,
+                                                     reason="خرید اشتراک")
+                except Exception:
+                    pass
+            resp = "🎫 اشتراک 1 ماهه با موفقیت خریداری شد."
+        elif self.product_name == "رول اختصاصی":
+            role = await create_and_assign_custom_role(interaction.guild,
+                                                       interaction.user)
+            if role:
+                d.setdefault("shoprole", {})[str(interaction.user.id)] = {
+                    "guild_id": str(interaction.guild.id),
+                    "role_id": str(role.id),
+                    "start_date": datetime.now(timezone.utc).isoformat()
+                }
+                resp = f"🎖 رول اختصاصی `{role.name}` ساخته و به شما داده شد!"
+            else:
+                resp = "❌ خطا در ساخت رول اختصاصی."
+        else:
+            resp = "✅ خرید ثبت شد."
+
+        await save_data_async(d)
+        await interaction.response.send_message(
+            f"{resp}\n💰 موجودی جدید: `{d.get('wallet', {}).get(uid,0)}`",
+            ephemeral=True)
+
+    @discord.ui.button(label="❌ نه", style=discord.ButtonStyle.red)
+    async def cancel(self, interaction: Interaction, button: Button):
+        await interaction.response.send_message(
+            "🛍 خرید لغو شد. بازگشت به فروشگاه.",
+            view=ShopView(),
+            ephemeral=True)
+
+
+class OrdersSelect(Select):
+
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="استریمر",
+                                 description="خدمات مرتبط با استریم"),
+            discord.SelectOption(label="ممبر عادی", description="خدمات ممبر")
+        ]
+        super().__init__(placeholder="انتخاب دسته‌بندی سفارش",
+                         min_values=1,
+                         max_values=1,
+                         options=options)
+
+    async def callback(self, interaction: Interaction):
+        choice = self.values[0]
+        if choice == "استریمر":
+            await interaction.response.send_message("📋 سفارشات استریمر:",
+                                                    view=StreamerOrdersView(),
+                                                    ephemeral=True)
+        else:
+            await interaction.response.send_message("📋 سفارشات ممبر:",
+                                                    view=MemberOrdersView(),
+                                                    ephemeral=True)
+
+
+class OrdersSelectView(View):
+
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.add_item(OrdersSelect())
+
+
+class StreamerOrdersView(View):
+
+    def __init__(self):
+        super().__init__(timeout=60)
+        items = [("طراحی لوگو", 10000), ("طراحی بنر اف استریم", 2000),
+                 ("طراحی دیسکریپشن استریم (عکس)", 5000),
+                 ("تغییرات اطلاعات استارت استریم", 3000),
+                 ("طراحی پک استریم", 10000)]
+        for label, price in items:
+            btn = Button(label=f"{label} — {price} سکه",
+                         style=discord.ButtonStyle.primary)
+
+            async def make_cb(interaction: Interaction, lbl=label, pr=price):
+                view = ConfirmOrderView(lbl, pr)
+                await interaction.response.send_message(
+                    f"آیا از خرید «{lbl}» به قیمت {pr} سکه مطمئن هستید؟",
+                    view=view,
+                    ephemeral=True)
+
+            btn.callback = make_cb
+            self.add_item(btn)
+
+
+class MemberOrdersView(View):
+
+    def __init__(self):
+        super().__init__(timeout=60)
+        items = [("تغییر بج نامبر به عدد دلخواه", 20000),
+                 ("طراحی لوگو پروفایل", 5000), ("دریافت پول مستر", 50000)]
+        for label, price in items:
+            btn = Button(label=f"{label} — {price} سکه",
+                         style=discord.ButtonStyle.primary)
+
+            async def make_cb(interaction: Interaction, lbl=label, pr=price):
+                view = ConfirmOrderView(lbl, pr)
+                await interaction.response.send_message(
+                    f"آیا از خرید «{lbl}» به قیمت {pr} سکه مطمئن هستید؟",
+                    view=view,
+                    ephemeral=True)
+
+            btn.callback = make_cb
+            self.add_item(btn)
+
+
+class ConfirmOrderView(View):
+
+    def __init__(self, label, price):
+        super().__init__(timeout=60)
+        self.label = label
+        self.price = price
+
+    @discord.ui.button(label="آره", style=discord.ButtonStyle.green)
+    async def yes_cb(self, interaction: Interaction, button: Button):
+        d = load_data()
+        wallets = d.setdefault("wallet", {})
+        uid = str(interaction.user.id)
+        bal = wallets.get(uid, 0)
+
+        if bal < self.price:
+            await interaction.response.send_message(
+                "❌ موجودی کافی برای این سفارش وجود ندارد.", ephemeral=True)
+            return
+
+        wallets[uid] = bal - self.price
+        d["wallet"] = wallets
+        await save_data_async(d)
+
+        # فقط ارسال به ادمین‌ها، بدون ذخیره در data.json
+        if interaction.guild:
+            for m in interaction.guild.members:
+                if is_admin_member(m):
+                    try:
+                        await m.send(
+                            f"📥 سفارش جدید از {interaction.user.mention}:\n"
+                            f"سفارش: {self.label}\n"
+                            f"قیمت: {self.price} سکه\n"
+                            f"در سرور: {interaction.guild.name}")
+                    except Exception:
+                        pass
+
+        await interaction.response.send_message(
+            "✅ سفارش ثبت شد و به ادمین‌ها اطلاع داده شد.", ephemeral=True)
+
+    @discord.ui.button(label="نه", style=discord.ButtonStyle.red)
+    async def no_cb(self, interaction: Interaction, button: Button):
+        await interaction.response.send_message("❌ سفارش کنسل شد.",
+                                                ephemeral=True)
+
+    @discord.ui.button(label="نه", style=discord.ButtonStyle.red)
+    async def no_cb(self, interaction: Interaction, button: Button):
+        await interaction.response.send_message("❌ سفارش کنسل شد.",
+                                                ephemeral=True)
+
+
+class ShopSelect(Select):
+
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="اشتراک 1 ماهه",
+                                 description=f"قیمت: {PRICE_SUB} سکه"),
+            discord.SelectOption(label="رول اختصاصی",
+                                 description=f"قیمت: {PRICE_ROLE_CUSTOM} سکه"),
+            discord.SelectOption(label="سفارشات خاص",
+                                 description="طراحی لوگو، بنر و ...")
+        ]
+        super().__init__(placeholder="انتخاب محصول...",
+                         min_values=1,
+                         max_values=1,
+                         options=options)
+
+    async def callback(self, interaction: Interaction):
+        choice = self.values[0]
+        uid = str(interaction.user.id)
+        d = load_data()
+        wallets = d.setdefault("wallet", {})
+        balance = wallets.get(uid, 0)
+        prices = {"اشتراک 1 ماهه": PRICE_SUB, "رول اختصاصی": PRICE_ROLE_CUSTOM}
+        if choice == "سفارشات خاص":
+            await interaction.response.send_message(
+                "📦 لطفا نوع سفارش را انتخاب کنید:",
+                view=OrdersSelectView(),
+                ephemeral=True)
+            return
+        price = prices.get(choice, 0)
+        if balance < price:
+            await interaction.response.send_message(
+                f"❌ موجودی شما کافی نیست!\n💰 موجودی: `{balance}`\n🔸 نیاز: `{price}`",
+                ephemeral=True)
+            return
+        # ask for confirmation
+        await interaction.response.send_message(
+            f"🛍 آیا مطمئن هستی که می‌خوای «{choice}» را به قیمت `{price}` سکه بخری؟",
+            view=ConfirmBuyView(choice, price),
+            ephemeral=True)
+
+
+class ShopView(View):
+
+    def __init__(self):
+        super().__init__(timeout=900)
+        self.add_item(ShopSelect())
+
+
+@bot.tree.command(name="shop", description="🛍 فروشگاه شکرسیتی (مدرن)")
+async def shop_cmd(interaction: Interaction):
+    embed = discord.Embed(
+        title="🛍 فروشگاه شکرسیتی",
+        description="انتخاب کنید چه محصولی می‌خواهید خرید کنید.",
+        color=discord.Color.gold())
+    embed.add_field(name="اشتراک 1 ماه",
+                    value=f"{PRICE_SUB} سکه",
+                    inline=False)
+    embed.add_field(
+        name="رول اختصاصی",
+        value=
+        f"{PRICE_ROLE_CUSTOM} سکه\n(رول اختصاصی ساخته می‌شود و ۳۰ روز اعتبار دارد)",
+        inline=False)
+    embed.add_field(name="سفارشات خاص",
+                    value="خدمات طراحی و تغییرات پروفایل",
+                    inline=False)
+    await interaction.response.send_message(embed=embed,
+                                            view=ShopView(),
+                                            ephemeral=True)
+
+
+# -------------------------
+# /tam command (view subscriptions and renew)
+# -------------------------
+class RenewButton(Button):
+
+    def __init__(self, label, cost, kind):
+        super().__init__(label=label, style=discord.ButtonStyle.green)
+        self.cost = cost
+        self.kind = kind
+
+    async def callback(self, interaction: Interaction):
+        uid = str(interaction.user.id)
+        d = load_data()
+        wallets = d.setdefault("wallet", {})
+        bal = wallets.get(uid, 0)
+
+        # بررسی موجودی
+        if bal < self.cost:
+            await interaction.response.send_message(
+                "❌ موجودی کافی برای تمدید وجود ندارد.", ephemeral=True)
+            return
+
+        # کم کردن پول از حساب
+        wallets[uid] = bal - self.cost
+
+        # بررسی نوع تمدید (اشتراک معمولی)
+        if self.kind == "sub":
+            d.setdefault("subscription",
+                         {})[uid] = datetime.now(timezone.utc).isoformat()
+            await save_data_async(d)
+            await interaction.response.send_message("✅ اشتراک شما تمدید شد.",
+                                                    ephemeral=True)
+            return
+
+        # بررسی نوع تمدید (رول اختصاصی)
+        elif self.kind == "shoprole":
+            shoprole = d.setdefault("shoprole", {})
+            key = str(uid)
+            if key not in shoprole:
+                await interaction.response.send_message(
+                    "❌ شما رول اختصاصی فعال ندارید.", ephemeral=True)
+                return
+
+    # بروزرسانی تاریخ شروع اشتراک رول اختصاصی
+            shoprole[key]["start_date"] = datetime.now(
+                timezone.utc).isoformat()
+
+            # ثبت تغییر در دیکشنری اصلی
+            d["shoprole"] = shoprole
+
+            # ذخیره در فایل data.json
+            await save_data_async(d)
+
+            # بررسی دوباره بعد از ذخیره
+            check = load_data()
+            print(
+                f"✅ تاریخ جدید رول اختصاصی برای {key}: {check['shoprole'][key]['start_date']}"
+            )
+
+            await interaction.response.send_message(
+                "✅ رول اختصاصی شما تمدید شد و در فایل ذخیره شد.",
+                ephemeral=True)
+            return
+
+
+@bot.tree.command(name="tam", description="نمایش اشتراک‌ها و تمدید آنها")
+async def tam_cmd(interaction: Interaction):
+    uid = str(interaction.user.id)
+    d = load_data()
+    wallets = d.get("wallet", {})
+    bal = wallets.get(uid, 0)
+    subs = d.get("subscription", {})
+    shoprole = d.get("shoprole", {})
+
+    embed = discord.Embed(title="📋 وضعیت اشتراک‌ها",
+                          color=discord.Color.blue())
+    embed.add_field(name="موجودی", value=f"{bal} سکه", inline=False)
+
+    # وضعیت اشتراک معمولی
+    sub_status = "❌ ندارد"
+    has_sub = False
+    if uid in subs:
+        start = datetime.fromisoformat(subs[uid])
+        end = start + timedelta(days=30)
+        remain = end - datetime.now(timezone.utc)
+        if remain.total_seconds() > 0:
+            sub_status = f"✅ فعال — {remain.days} روز مانده"
+            has_sub = True
+        else:
+            sub_status = "⛔ منقضی شده"
+    embed.add_field(name="اشتراک معمولی", value=sub_status, inline=False)
+
+    # وضعیت رول اختصاصی
+    shop_status = "❌ ندارد"
+    has_role = False
+    if uid in shoprole:
+        info = shoprole[uid]
+        start = datetime.fromisoformat(info["start_date"])
+        end = start + timedelta(days=30)
+        remain = end - datetime.now(timezone.utc)
+        if remain.total_seconds() > 0:
+            shop_status = f"✅ رول اختصاصی فعال — {remain.days} روز مانده"
+            has_role = True
+        else:
+            shop_status = "⛔ منقضی شده"
+    embed.add_field(name="رول اختصاصی", value=shop_status, inline=False)
+
+    # اگر هیچ اشتراکی ندارد → پیام هشدار بده
+    if not has_sub and not has_role:
+        await interaction.response.send_message(
+            "❌ شما هیچ اشتراک فعالی برای تمدید ندارید.", ephemeral=True)
+        return
+
+    # ساخت دکمه‌های مجاز فقط برای اشتراک‌های فعال
+    view = View()
+    if has_sub:
+        view.add_item(
+            RenewButton(f"🔄 تمدید اشتراک ({PRICE_SUB} سکه)", PRICE_SUB, "sub"))
+    if has_role:
+        view.add_item(
+            RenewButton(f"🎖 تمدید رول اختصاصی ({PRICE_ROLE_CUSTOM} سکه)",
+                        PRICE_ROLE_CUSTOM, "shoprole"))
+
+    await interaction.response.send_message(embed=embed,
+                                            view=view,
+                                            ephemeral=True)
+
+
+# -------------------------
+# basic on_ready and events
+# -------------------------
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
+    try:
+        await bot.tree.sync()
+        print("✅ Tree synced")
+    except Exception as e:
+        print("⚠️ sync error:", e)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    # clean wallet, subscription, badges, shoprole etc
+    uid = str(member.id)
+    d = load_data()
+    d.get("wallet", {}).pop(uid, None)
+    d.get("subscription", {}).pop(uid, None)
+    d.get("warns", {}).pop(uid, None)
+    d.get("badges", {}).pop(uid, None)
+    # remove shoprole if any
+    shop = d.get("shoprole", {})
+    if uid in shop:
+        entry = shop.pop(uid)
+        try:
+            g = bot.get_guild(int(entry.get("guild_id")))
+            if g:
+                role = g.get_role(int(entry.get("role_id")))
+                if role:
+                    try:
+                        await role.delete(
+                            reason="User left - cleaning custom shop role")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    await save_data_async(d)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    # give 1 coin per message
+    uid = str(message.author.id)
+    d = load_data()
+    wallets = d.setdefault("wallet", {})
+    wallets[uid] = wallets.get(uid, 0) + 1
+    await save_data_async(d)
+    await bot.process_commands(message)
+
+
+@bot.event
+async def setup_hook():
+    # اجرای تسک چک اشتراک‌ها پس از آماده شدن ربات
+    bot.loop.create_task(check_subscriptions_loop())
+
+
 # -------------------------
 # اجرای بات
 # -------------------------
+
 if __name__ == "__main__":
     try:
         bot.run(TOKEN)
