@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 from discord.ext import commands
 from discord import app_commands, Interaction, TextChannel, Member
 from discord.ui import View, Button, Modal, TextInput, Select
-from dotenv import load_dotenv
 
 # -------------------------
 # تنظیمات و بارگذاری توکن
